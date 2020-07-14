@@ -1,0 +1,423 @@
+import random as R
+
+import math as M
+
+from collections import Counter
+from collections import deque
+
+import salabim as sim
+
+import gym
+
+import numpy as NP
+
+import torch as T
+import torch.nn as nn
+import torch.nn.functional as F 
+
+import matplotlib.pyplot as plt 
+
+import keras as K 
+from keras.models import Sequential
+from keras.layers import Dense, Dropout
+from keras.optimizers import Adam
+
+import tensorflow as TF
+
+'''
+    РћРєСЂСѓР¶РµРЅРёРµ
+'''
+
+class Customer(sim.Component): # РєР»Р°СЃСЃ РєР»РёРµРЅС‚Р°(РїРѕР·РІРѕРЅРёРІС€РµРіРѕ)
+        def process(self):
+            if len(waitingline) >= QueueLength:
+                env.number_balked += 1
+                env.print_trace("", "", "balked") # РЅРµСѓРґР°Р»РѕСЃСЊ РѕР±СЃР»СѓР¶РёС‚СЊ
+                yield self.cancel()
+            self.enter(waitingline)
+            for clerk in clerks:
+                if clerk.ispassive():
+                    clerk.activate()
+                    break  # Р°РєС‚РёРІР°С†РёСЏ РѕРґРЅРѕРіРѕ РѕРїРµСЂР°С‚РѕСЂР°
+            yield self.hold(WaitingQueue)  # РµСЃР»Рё РЅРµ РѕР±СЃР»СѓР¶РёР»Рё РІ РѕРїСЂРµРґРµР»РµРЅРЅРѕРµ РІСЂРµРјСЏ, РєР»РёРµРЅС‚ СѓР№РґРµС‚
+            if self in waitingline:
+                self.leave(waitingline)
+                env.number_reneged += 1
+                env.print_trace("", "", "reneged") # СѓС€РµР»
+            else:
+                yield self.passivate()  # РѕР¶РёРґР°РЅРёРµ СЃРґРµР»Р°РЅРЅС‹С… СѓСЃР»СѓРі
+
+class CustomerGenerator(sim.Component): # РєР»Р°СЃСЃ РіРµРЅРµСЂР°С‚РѕСЂР° РєР»РёРµРЅС‚РѕРІ
+        def process(self):
+            while True:
+                Customer()
+                yield self.hold(sim.Uniform(1, 5).sample())
+    
+class Clerk(sim.Component): # РєР»Р°СЃСЃ РѕРїРµСЂР°С‚РѕСЂР° self.Q_states[]
+        def process(self):
+            while True:
+                while len(waitingline) == 0:
+                    yield self.passivate()
+                self.customer = waitingline.pop()
+                self.customer.activate()  # РєР»РёРµРЅС‚ СѓР№РґРµС‚ РµСЃР»Рё РїСЂРµРІС‹С€РµРЅРѕ РІСЂРµРјСЏ РѕР¶РёРґР°РЅРёСЏ
+                yield self.hold(DelayClerk)
+                self.customer.activate()  # СЃРёРіРЅР°Р» РєР»РёРµРЅС‚Сѓ С‡С‚Рѕ РІСЃРµ СЃРґРµР»Р°РЅРѕ
+                print(self.customer.activate())
+
+''' 
+РљР»Р°СЃСЃ РЅРµР№СЂРѕРЅРЅРѕР№ СЃРµС‚Рё РґР»СЏ РёР·РјРµРЅРµРЅРёСЏ РєРѕР»РёС‡РµСЃС‚РІР° РѕРїРµСЂР°С‚РѕСЂРѕРІ - РђРіРµРЅС‚
+'''
+
+class ClerksDQNAgent(): 
+    def __init__(self, clerk_size, state_size, action_size,
+                 window_size, NumClerks, number_reneged, number_balked,
+                 WaitingQueue, TimeInterval, inter_arrival_time, DelayClerk, 
+                 batch_size, trend, inventory_clerks, ab_potok):
+        
+        self.state_size         = state_size
+        self.window_size        = window_size
+        self.half_window        = window_size // 2
+        self.trend              = trend
+        self.skip               = skip
+
+        self.action_size        = action_size
+        self.batch_size         = batch_size
+        self.memory             = deque(maxlen = 1000)
+
+        self.number_balked      = number_balked
+        self.number_reneged     = number_reneged
+        self.NumClerks          = NumClerks
+        self.WaitingQueue       = WaitingQueue
+        self.TimeInterval       = TimeInterval
+        self.inter_arrival_time = inter_arrival_time
+        self.ab_potok           = ab_potok
+
+        self.gamma              = 0.95
+        self.epsilon            = 1.0
+        self.epsilon_min        = 0.01
+        self.epsilon_decay      = 0.995
+        self.learnig_rate       = 0.001
+        self.tau                = 0.125
+
+        TF.reset_default_graph()
+        self.sess               = TF.InteractiveSession()
+        self.X                  = TF.placeholder(TF.float32, [None, self.state_size])
+        self.Y                  = TF.placeholder(TF.float32, [None, self.action_size])
+        feed                    = TF.layers.dense(self.X, 256, activation = TF.nn.relu) #len(ab_potok)
+        self.log                = TF.layers.dense(feed, self.action_size)
+        self.num                = TF.reduce_mean(TF.square(self.Y - self.log))
+        self.optimizer          = TF.train.GradientDescentOptimizer(1e-5).minimize(self.num)
+        self.sess.run(TF.global_variables_initializer())
+
+'''
+    def Agent_action(self, state):
+        if R.random() <= self.epsilon:
+            return R.randrange(self.action_size)
+        
+        return np.argmax(self.sess.run(self.logits, feed_dict = {self.X: state})[0])
+
+    def Agent_get_state(self, t):
+        window_size = self.window_size + 1
+        d = t - window_size + 1
+        if d >= 0:
+            block = self.trend[d : t + 1]
+        else:
+            block = -d * [self.trend[0]] + self.trend[0 : t + 1]
+        
+        res = []
+        
+        for i in range(window_size - 1):
+            res.append(block[i + 1] - block[i])
+        
+        return NP.array([res])
+    
+    def Agent_replay(self, batch_size):
+        mini_batch = []
+        l = len(self.memory)
+        for i in range(l - batch_size, l):
+            mini_batch.append(self.memory)
+        replay_size = len(mini_batch)
+        X = NP.empty((replay_size, self.state_size))
+        Y = NP.empty((replay_size, self.action_size))
+        
+        for a in mini_batch:
+            states = NP.array(a[0][0])
+        
+        for a in mini_batch:
+            new_states = NP.array(a[3][0])
+        
+        Q = self.sess.run(self.log, feed_dict = {self.X: states})
+        Q_new = self.sess.run(self.log, feed_dict = {self.X: new_states})
+        for i in range(len(mini_batch)):
+            state, action, reward, next_state, done = mini_batch[i]
+            target = Q[i]
+            target[action] = reward
+            if not done:
+                target[action] += self.gamma * NP.amax(Q_new[i])
+            X[i] = state
+            Y[i] = target
+        num, _ self.sess.run([self.cos, self.optimizer], feed_dict = {self.X: X, self.Y: Y})
+        
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+        return num
+    
+    def Agent_change_clerks(self, NumClerks):
+        starting_clerks = NumClerks
+        states_add = []
+        states_remove = []
+        state = self.Agent_get_state(0)
+        for t in range(0, len(self.trend) - 1, self.skip):
+            action = self.Agent_action(state)
+            next_state = self.Agent_get_state(t + 1)
+
+            if action == 1 and starting_clerks[t] >= self.trend[t] and t < (len(self.trend) - self.half_window):
+                starting_clerks.append(int(self.trend[t]))
+                starting_clerks += int(self.trend[t])
+                states_add.appen(t)
+
+            elif action == 2 and len():
+                starting_clerks -= int(self.trend[t])
+                states_remove.append(int(self.trend[t]))
+            
+            state = next_state
+        return states_add, states_remove
+    
+    def Agent_train(self, iters, checkint, starting_clerks, ab_potok):
+        for i in range(len(ab_potok)):
+            state = self.Agent_get_state(0)
+            starting_clerks = NumClerks
+            for t in range(0, len(self.trend) - 1, self.skip):
+                action self.Agent_action(state)
+                next_state = self.get_state(t + 1)
+
+
+    def Agent_change_clerks():
+        
+'''
+
+'''
+ РљР»Р°СЃСЃ РЅРµР№СЂРѕРЅРЅРѕР№ СЃРµС‚Рё РґР»СЏ РїСЂРµРґСЃРєР°Р·С‹РІР°РЅРёСЏ РїРѕС‚РѕРєР° 
+'''
+
+class FlowRNN(nn.Module):
+    
+    def __init__(self, input_size, hidden_size, embedding_size, n_layers = 1):
+        super(FlowRNN, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.embedding_size = embedding_size
+        self.n_layers = n_layers
+
+        self.encoder = nn.Embedding(self.input_size, self.embedding_size)
+        self.lstm = nn.LSTM(self.embedding_size, self.hidden_size, self.n_layers)
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(self.hidden_size, self.input_size)
+        
+    def forward(self, x, hidden):
+        x = self.encoder(x).squeeze(2)
+        out, (ht1, ct1) = self.lstm(x, hidden)
+        out = self.dropout(out)
+        x = self.fc(out)
+        return x, (ht1, ct1)
+    
+    def init_hidden(self, batch = 1):
+        return (T.zeros(self.n_layers, batch, self.hidden_size, requires_grad = True).to(device),
+               T.zeros(self.n_layers, batch, self.hidden_size, requires_grad = True).to(device))
+
+def text_to_seq(text_sample):
+    char_counts = Counter(text_sample_in)
+    char_counts = sorted(char_counts.items(), key = lambda x: x[1], reverse=True)
+
+    sorted_chars = [char for char, _ in char_counts]
+    print(sorted_chars)
+    char_to_idx = {char: index for index, char in enumerate(sorted_chars)}
+    idx_to_char = {v: k for k, v in char_to_idx.items()}
+    chain = np.array([char_to_idx[char] for char in text_sample_in])
+    
+    return chain, char_to_idx, idx_to_char
+
+def get_batch(chain):
+    trains = []
+    targets = []
+    for _ in range(batch):
+        batch_start = np.random.randint(0, len(chain) - chain_length)
+        chunk = chain[batch_start: batch_start + chain_length]
+        train = T.LongTensor(chunk[:-1]).view(-1, 1)
+        target = T.LongTensor(chunk[1:]).view(-1, 1)
+        trains.append(train)
+        targets.append(target)
+    return T.stack(trains, dim = 0), T.stack(targets, dim = 0)
+
+def evaluate(model, char_to_idx, idx_to_char, start_text = ' ', prediction_len = 200, temp = 0.3):
+    hidden = model.init_hidden()
+    idx_input = [char_to_idx[char] for char in start_text]
+    train = T.LongTensor(idx_input).view(-1, 1, 1).to(device)
+    predicted_text = start_text
+  
+    _, hidden = model(train, hidden)
+        
+    inp = train[-1].view(-1, 1, 1)
+    
+    for i in range(prediction_len):
+        output, hidden = model(inp.to(device), hidden)
+        output_logits = output.cpu().data.view(-1)
+        p_next = F.softmax(output_logits / temp, dim = -1).detach().cpu().data.numpy()        
+        top_index = np.random.choice(len(char_to_idx), p = p_next)
+        inp = T.LongTensor([top_index]).view(-1, 1, 1).to(device)
+        predicted_char = idx_to_char[top_index]
+        predicted_text += predicted_char
+    
+    return predicted_text
+
+def gen(ab_potok, l, mu = 13, sigma = 2):
+    for i in range(200):
+        l += 0.1
+        f = (1 / (sigma * m.sqrt(2 * m.pi))) * m.e ** (-((l - mu) ** 2 / (2 * sigma ** 2))) * 10 * random.randint(3, 4)
+        ab_potok.append(str(round(f * 10)))
+    return ab_potok
+
+def gen_ab_v_den(ab_potok, l, mu = 13, sigma = 2):
+    for j in range(1):
+        ab_potok = gen(ab_potok, l)
+    return ab_potok
+
+
+
+'''
+РћСЃРЅРѕРІРЅР°СЏ РїСЂРѕРіСЂР°РјРјР°
+'''
+'''
+
+l = 0; ab_potok = []; k = []
+
+ab_potok = gen_ab_v_den(ab_potok, l)
+
+with open("/media/admin1/РЈС‡РµР±Р°/train_text.txt", "w") as file:
+    for line in ab_potok:
+        file.write(line + "\n")
+
+
+#for i in range(len(ab_potok)):
+#    l += 0.1
+#    k.append(l)
+
+#plt.xlabel("РІСЂРµРјСЏ")
+#plt.ylabel("РєРѕР»-РІРѕ Р»СЋРґРµР№")
+#plt.plot(k, ab_potok)
+#plt.grid()
+#plt.show()
+
+
+Train_Text_File = "/media/admin1/РЈС‡РµР±Р°/train_text.txt"
+
+with open(Train_Text_File) as text_file:
+    text_sample_in = text_file.readlines()
+text_sample_in = ' '.join(text_sample_in)
+
+chain, char_to_idx, idx_to_char = text_to_seq(text_sample_in)
+
+chain_length = 100
+batch = 18
+
+device = T.device('cuda') if T.cuda.is_available() else T.device('cpu')
+model = FlowRNN(input_size=len(idx_to_char), hidden_size=128, embedding_size=128, n_layers=2)
+model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = T.optim.Adam(model.parameters(), lr = 1e-2, amsgrad = True)
+scheduler = T.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, 
+    patience=5, 
+    verbose=True, 
+    factor=0.5
+)
+
+Nepochs = 50000
+loss_avg = []
+
+for epoch in range(Nepochs):
+    model.train()
+    train, target = get_batch(chain)
+    train = train.permute(1, 0, 2).to(device)
+    target = target.permute(1, 0, 2).to(device)
+    hidden = model.init_hidden(batch)
+
+    output, hidden = model(train, hidden)
+    loss = criterion(output.permute(1, 2, 0), target.squeeze(-1).permute(1, 0))
+    
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    
+    loss_avg.append(loss.item())
+    if len(loss_avg) >= 50:
+        mean_loss = np.mean(loss_avg)
+        print(f'Loss: {mean_loss}')
+        scheduler.step(mean_loss)
+        loss_avg = []
+        model.eval()
+        predicted_text = evaluate(model, char_to_idx, idx_to_char)
+        print(predicted_text)
+
+model.eval()
+
+print(evaluate(
+    model, 
+    char_to_idx, 
+    idx_to_char, 
+    temp = 0.3, 
+    prediction_len = 1000, 
+    start_text = '. '
+    )
+)
+'''
+
+    #РћСЃРЅРѕРІРЅР°СЏ РїСЂРѕРіСЂР°РјРјР°
+
+sim.Environment(time_unit = 'hours')
+i = 0
+save = None
+DelayClerk = 6 # Р·Р°РґРµСЂР¶РєР° РѕРїРµСЂР°С‚РѕСЂР° РїРµСЂРµРґ РІС‹Р·РѕРІРѕРј
+sum1 = 0; sum2 = sum1
+WaitingQueue = 5 # РѕС‡РµСЂРµРґСЊ РѕР¶РёРґР°РЅРёСЏ
+QueueLength = 10 # РґР»РёРЅР° РѕС‡РµСЂРµРґРё
+NumClerks = []
+TimeInterval = sim.Poisson(10).sample()
+inter_arrival_time = [] # РІСЂРµРјСЏ РјРµР¶РґСѓ Р·РІРѕРЅРєР°РјРё
+
+for _ in range(DelayClerk):
+    NumClerks.append(random.randint(1, 5)) 
+    inter_arrival_time.append(sim.Exponential(random.randint(1, 15))) 
+   
+for i in range(len(ab_potok)):
+    env = sim.Environment()
+    CustomerGenerator()
+    env.number_balked = 0
+    env.number_reneged = 0
+    clerks = [Clerk() for _ in range(NumClerks[i])]
+    waitingline = sim.Queue("waitingline")
+    waitingline.length.monitor(False)
+    env.run(duration = TimeInterval)  # first do a prerun of 1500 time units without collecting data
+    waitingline.length.monitor(True)
+    env.run(duration = TimeInterval)  # now do the actual data collection for 1500 time units
+    waitingline.length.print_histogram(30, 0, 1) # РґР»РёРЅР° Р»РёРЅРёРё РѕР¶РёРґР°РЅРёСЏ
+    waitingline.length_of_stay.print_histogram(30, 0, 10) #РїСЂРѕРґРѕР»Р¶РёС‚РµР»СЊРЅРѕСЃС‚СЊ РѕР¶РёРґР°РЅРёСЏ РІ РѕС‡РµСЂРµРґРё
+    print("number reneged", env.number_reneged)
+    print("number balked", env.number_balked)
+    sum1 += env.number_reneged
+    sum2 += env.number_balked 
+   
+        #if i < len(NumClerks):
+        #    if (env.number_reneged != 0):
+        #        NumClerks[i] += 1
+        #    elif env.number_reneged == save:
+        #        NumClerks[i] -= 1
+        #    save = env.number_reneged
+        #print("РЎСѓРјРјР° РѕС‚РєР°Р·Р°РІС€РёС…СЃСЏ", sum1, "РЎСѓРјРјР° СѓС€РµРґС€РёС…", sum)
+
+'''
+РђРЅРґСЂРµР№ , СЏ РїСЂРµРґР»Р°РіР°СЋ РІРѕС‚ С‡С‚Рѕ СЃРґРµР»Р°С‚СЊ, РЅРµР№СЂРѕРЅРєСѓ СЃ РїРѕРґРєСЂРµРїР»РµРЅРёРµРј РЅРµ РґРµР»Р°С‚СЊ РЅР° РёР·РјРµРЅРµРЅРёРµ РєРѕР»РёС‡РµСЃС‚РІР° РѕРїРµСЂР°С‚РѕСЂРѕРІ,
+Р° РѕРїРёСЃР°С‚СЊ С„РѕСЂРјСѓР»Сѓ Р­СЂР»Р°РЅРіР°, РєРѕС‚РѕСЂР°СЏ Р±СѓРґРµС‚ СЂР°Р±РѕС‚Р°С‚СЊ РІ СЂРµР°Р»СЊРЅРѕРј РІСЂРµРјРµРЅРё 
+'''
